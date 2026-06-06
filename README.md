@@ -94,15 +94,6 @@ Do not use it as the sole protection for critical secrets.
 v0.2.0
 ```
 
-## Deploy
-
-For Cloudflare Pages:
-
-```powershell
-cd "$env:USERPROFILE\Desktop\zeta-trace-cypher-v02"
-npx wrangler pages deploy . --project-name zeta-trace-cypher
-```
-
 ## Project statement
 
 > Text walks.  
