@@ -12,7 +12,7 @@
   <main class="app">
     <header class="topbar">
       <h1>ZETA TRACE CYPHER</h1>
-      <span>v0.2.0</span>
+      <span>v0.3.0</span>
     </header>
 
     <p class="lead">ZETA 2 CYPHER の暗号データを、より大きなPNGランダムウォークの一本線として保存・復号します。</p>
@@ -59,7 +59,7 @@
           <span>PNG読み込み</span>
           <div class="actions wrap file-row">
             <label class="file-button" for="loadPngFile">PNGを選択</label>
-            <input id="loadPngFile" type="file" accept=".png,image/png" />
+            <input id="loadPngFile" type="file" accept="image/png,image/jpeg,image/webp" />
             <button id="clearDecodeBtn" type="button">クリア</button>
           </div>
           <div class="canvas-wrap small">
@@ -91,7 +91,7 @@
       </article>
     </section>
 
-    <p class="note">元PNGのみ対応。本文は最大6000 bytes。JPEG、スクリーンショット、回転、リサイズ、トリミングにはまだ対応していません。</p>
+    <p class="note">元PNG推奨。本文は最大6000 bytes。一度アップロード後に軽く再保存・縮小された画像も読めるよう調整していますが、強い圧縮、スクリーンショット、回転、トリミングにはまだ弱いです。</p>
     <p id="statusText" class="status" aria-live="polite">Ready</p>
   </main>
 

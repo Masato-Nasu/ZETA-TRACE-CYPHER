@@ -6,6 +6,7 @@ const MAGIC = [0x5a, 0x32, 0x43, 0x32]; // Z2C2
 const CARRIER_MAGIC = [0x5a, 0x52, 0x57, 0x31]; // ZRW1
 const DEFAULT_ITERATIONS = 250000;
 const MAX_MESSAGE_BYTES = 6000;
+const DECODER_DISTANCE_LIMIT = 130;
 
 const CELL_SIZE = 28;
 const ROW_GAP = 4;
@@ -377,21 +378,43 @@ function renderWalkPngToCanvas(canvas, carrierBytes) {
   return layout;
 }
 
-function extractCellBitmap(imageData, x0, y0) {
+function luminanceAt(imageData, x, y) {
+  x = Math.max(0, Math.min(imageData.width - 1, Math.floor(x)));
+  y = Math.max(0, Math.min(imageData.height - 1, Math.floor(y)));
+  const p = (y * imageData.width + x) * 4;
+  const d = imageData.data;
+  return (d[p] * 0.299 + d[p + 1] * 0.587 + d[p + 2] * 0.114);
+}
+
+function estimateThreshold(imageData) {
+  const d = imageData.data;
+  let min = 255;
+  let max = 0;
+  const step = Math.max(4, Math.floor(d.length / 16000 / 4) * 4);
+  for (let p = 0; p < d.length; p += step * 4) {
+    const lum = d[p] * 0.299 + d[p + 1] * 0.587 + d[p + 2] * 0.114;
+    if (lum < min) min = lum;
+    if (lum > max) max = lum;
+  }
+  // A high threshold keeps anti-aliased / recompressed dark strokes readable,
+  // while still rejecting ordinary white background noise.
+  return Math.max(110, Math.min(230, (min + max) / 2 + 24));
+}
+
+function extractCellBitmap(imageData, x0, y0, cellW = CELL_SIZE, cellH = CELL_SIZE, threshold = 128) {
   const bitmap = new Uint8Array(TEMPLATE_POINT_COUNT);
-  const data = imageData.data;
-  const width = imageData.width;
   for (let y = 0; y < CELL_SIZE; y++) {
     for (let x = 0; x < CELL_SIZE; x++) {
-      const p = ((y0 + y) * width + (x0 + x)) * 4;
-      const lum = (data[p] + data[p + 1] + data[p + 2]) / 3;
-      bitmap[y * CELL_SIZE + x] = lum < 128 ? 1 : 0;
+      const sx = x0 + (x + 0.5) * cellW / CELL_SIZE;
+      const sy = y0 + (y + 0.5) * cellH / CELL_SIZE;
+      const lum = luminanceAt(imageData, sx, sy);
+      bitmap[y * CELL_SIZE + x] = lum < threshold ? 1 : 0;
     }
   }
   return bitmap;
 }
 
-function inferLayoutFromImage(width, height) {
+function exactLayoutFromImage(width, height) {
   if (width <= MARGIN * 2 || height <= MARGIN * 2) throw new Error('PNGサイズが不正です。');
   const colsFloat = (width - MARGIN * 2) / CELL_SIZE;
   if (!Number.isInteger(colsFloat) || colsFloat < 1 || colsFloat > MAX_COLS) throw new Error('PNGレイアウトを認識できません。');
@@ -399,7 +422,38 @@ function inferLayoutFromImage(width, height) {
   const rowsFloat = (height - MARGIN * 2 + ROW_GAP) / (CELL_SIZE + ROW_GAP);
   if (!Number.isInteger(rowsFloat) || rowsFloat < 1) throw new Error('PNGレイアウトを認識できません。');
   const rows = rowsFloat;
-  return { cols, rows, padded: cols * rows, width, height };
+  return { cols, rows, padded: cols * rows, width, height, scale: 1, scaled: false };
+}
+
+function inferLayoutsFromImage(width, height) {
+  const candidates = [];
+  try { candidates.push(exactLayoutFromImage(width, height)); } catch {}
+
+  for (let cols = 1; cols <= MAX_COLS; cols++) {
+    const baseWidth = MARGIN * 2 + cols * CELL_SIZE;
+    const scale = width / baseWidth;
+    if (!Number.isFinite(scale) || scale <= 0.15 || scale > 8) continue;
+    const rowsFloat = (height / scale - (MARGIN * 2 - ROW_GAP)) / (CELL_SIZE + ROW_GAP);
+    const rows = Math.round(rowsFloat);
+    if (rows < 1) continue;
+    const baseHeight = MARGIN * 2 + rows * CELL_SIZE + Math.max(0, rows - 1) * ROW_GAP;
+    const expectedHeight = baseHeight * scale;
+    const err = Math.abs(expectedHeight - height);
+    const rel = err / Math.max(1, height);
+    if (err <= 3 || rel <= 0.012) {
+      const key = `${cols}x${rows}@${scale.toFixed(6)}`;
+      if (!candidates.some(c => `${c.cols}x${c.rows}@${(c.scale || 1).toFixed(6)}` === key)) {
+        candidates.push({ cols, rows, padded: cols * rows, width, height, scale, scaled: Math.abs(scale - 1) > 0.001, error: err });
+      }
+    }
+  }
+
+  candidates.sort((a, b) => {
+    if (a.scaled !== b.scaled) return a.scaled ? 1 : -1;
+    return (a.error || 0) - (b.error || 0);
+  });
+  if (!candidates.length) throw new Error('PNGレイアウトを認識できません。');
+  return candidates;
 }
 
 function matchTemplate(bitmap, mirrored) {
@@ -415,24 +469,54 @@ function matchTemplate(bitmap, mirrored) {
     const d = hammingDistance(bitmap, table[byte]);
     if (d < bestDistance) { bestDistance = d; bestByte = byte; }
   }
-  if (bestDistance <= 18) return bestByte;
+  if (bestDistance <= DECODER_DISTANCE_LIMIT) return bestByte;
   throw new Error('PNGの線パターンを読み取れません。');
 }
 
-function carrierBytesFromImageData(imageData) {
-  const layout = inferLayoutFromImage(imageData.width, imageData.height);
+function carrierBytesFromLayout(imageData, layout, maxBytes = Infinity) {
   const bytes = [];
+  const threshold = estimateThreshold(imageData);
+  const s = layout.scale || 1;
+  const cellW = CELL_SIZE * s;
+  const cellH = CELL_SIZE * s;
+  const gapH = ROW_GAP * s;
+  const margin = MARGIN * s;
+  const limit = Math.min(layout.padded, maxBytes);
+
   for (let row = 0; row < layout.rows; row++) {
     const rtl = row % 2 === 1;
     for (let colInOrder = 0; colInOrder < layout.cols; colInOrder++) {
+      if (bytes.length >= limit) return new Uint8Array(bytes);
       const col = rtl ? layout.cols - 1 - colInOrder : colInOrder;
-      const x = MARGIN + col * CELL_SIZE;
-      const y = MARGIN + row * (CELL_SIZE + ROW_GAP);
-      const bitmap = extractCellBitmap(imageData, x, y);
+      const x = margin + col * cellW;
+      const y = margin + row * (cellH + gapH);
+      const bitmap = extractCellBitmap(imageData, x, y, cellW, cellH, threshold);
       bytes.push(matchTemplate(bitmap, rtl));
     }
   }
   return new Uint8Array(bytes);
+}
+
+function carrierBytesFromImageData(imageData) {
+  const layouts = inferLayoutsFromImage(imageData.width, imageData.height);
+  let lastError = null;
+
+  for (const layout of layouts) {
+    try {
+      const head = carrierBytesFromLayout(imageData, layout, Math.min(34, layout.padded));
+      if (head.length < 34) continue;
+      for (let i = 0; i < 4; i++) if (head[i] !== CARRIER_MAGIC[i]) throw new Error('magic mismatch');
+      const full = carrierBytesFromLayout(imageData, layout);
+      // parseCarrierBytes verifies length and CRC. Return the full padded stream after validation.
+      parseCarrierBytes(full);
+      return full;
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError && lastError.message && lastError.message !== 'magic mismatch'
+    ? lastError
+    : new Error('PNGからデータを正しく復元できません。');
 }
 
 function imageFileToImageData(file, canvas) {
@@ -533,7 +617,7 @@ async function loadPngFile(event) {
   try {
     const file = event.target.files && event.target.files[0];
     if (!file) return;
-    if (file.type && file.type !== 'image/png') throw new Error('PNGファイルを選択してください。');
+    if (file.type && !file.type.startsWith('image/')) throw new Error('画像ファイルを選択してください。');
     setStatus('PNG読み込み中…');
     loadedPngImageData = await imageFileToImageData(file, refs.decodeCanvas);
     refs.plainOutput.value = '';
