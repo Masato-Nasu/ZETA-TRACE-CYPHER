@@ -12,10 +12,10 @@
   <main class="app">
     <header class="topbar">
       <h1>ZETA TRACE CYPHER</h1>
-      <span>v0.3.0</span>
+      <span>v0.4.0</span>
     </header>
 
-    <p class="lead">ZETA 2 CYPHER の暗号データを、より大きなPNGランダムウォークの一本線として保存・復号します。</p>
+    <p class="lead">ZETA 2 CYPHER の暗号データを、PNGランダムウォークの筆跡として保存・復号します。大きなデータは自動で複数枚に分割されます。</p>
 
     <section class="layout" aria-label="ZETA TRACE CYPHER">
       <article class="panel">
@@ -44,11 +44,12 @@
           <div class="canvas-wrap">
             <canvas id="encodeCanvas" width="1" height="1" aria-label="生成されたPNGランダムウォーク"></canvas>
           </div>
+          <div id="encodePages" class="page-grid" aria-label="生成されたPNG一覧"></div>
           <p id="encodeInfo" class="meta-text">未生成</p>
         </div>
 
         <div class="actions wrap">
-          <button id="savePngBtn" type="button" disabled>PNG保存</button>
+          <button id="savePngBtn" type="button" disabled>すべてPNG保存</button>
         </div>
       </article>
 
@@ -59,7 +60,7 @@
           <span>PNG読み込み</span>
           <div class="actions wrap file-row">
             <label class="file-button" for="loadPngFile">PNGを選択</label>
-            <input id="loadPngFile" type="file" accept="image/png,image/jpeg,image/webp" />
+            <input id="loadPngFile" type="file" accept="image/png,image/jpeg,image/webp" multiple />
             <button id="clearDecodeBtn" type="button">クリア</button>
           </div>
           <div class="canvas-wrap small">
@@ -91,7 +92,7 @@
       </article>
     </section>
 
-    <p class="note">元PNG推奨。本文は最大6000 bytes。一度アップロード後に軽く再保存・縮小された画像も読めるよう調整していますが、強い圧縮、スクリーンショット、回転、トリミングにはまだ弱いです。</p>
+    <p class="note">元PNG推奨。本文は最大50000 bytes。大きな本文は自動で複数PNGに分割します。復号時は必要なPNGをまとめて選択してください。強い圧縮、スクリーンショット、回転、トリミングにはまだ弱いです。</p>
     <p id="statusText" class="status" aria-live="polite">Ready</p>
   </main>
 
