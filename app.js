@@ -4,10 +4,13 @@ const ZETA_DECIMAL_DIGITS = ZETA_DIGITS.slice(1);
 const MASK64 = (1n << 64n) - 1n;
 const MAGIC = [0x5a, 0x32, 0x43, 0x32]; // Z2C2
 const CARRIER_MAGIC = [0x5a, 0x52, 0x57, 0x31]; // ZRW1
-const PART_MAGIC = [0x5a, 0x54, 0x42, 0x31]; // ZTB1
-const DEFAULT_ITERATIONS = 250000;
-const LARGE_MESSAGE_WARNING_BYTES = 50000;
-const MAX_PART_PAYLOAD_BYTES = 1800;
+const APP_VERSION = '0.4.0';
+const CARRIER_VERSION_V1 = 1; // v0.3 PNG compatibility
+const CARRIER_VERSION_V2 = 2; // v0.4 hardened carrier
+const DEFAULT_ITERATIONS_V3 = 250000;
+const DEFAULT_ITERATIONS_V4 = 320000;
+const TAG_BYTES = 16;
+const MAX_MESSAGE_BYTES = 6000;
 const DECODER_DISTANCE_LIMIT = 130;
 
 const CELL_SIZE = 28;
@@ -18,8 +21,6 @@ const MAX_COLS = 72;
 const TEMPLATE_POINT_COUNT = CELL_SIZE * CELL_SIZE;
 
 let generatedPngName = '';
-let generatedPages = [];
-let loadedPngPages = [];
 let loadedPngImageData = null;
 let templateTable = null;
 let templateMaps = null;
@@ -32,7 +33,6 @@ const refs = {
   plainOutput: $('plainOutput'),
   statusText: $('statusText'),
   encodeCanvas: $('encodeCanvas'),
-  encodePages: $('encodePages'),
   decodeCanvas: $('decodeCanvas'),
   encodeInfo: $('encodeInfo'),
   decodeInfo: $('decodeInfo'),
@@ -85,24 +85,19 @@ function concatBytes(...arrays) {
   return out;
 }
 
-function uint16Bytes(n) {
-  return new Uint8Array([(n >>> 8) & 255, n & 255]);
-}
-
-function readUint16(bytes, pos) {
-  return ((bytes[pos] << 8) | bytes[pos + 1]) >>> 0;
-}
-
-function bytesToHex(bytes) {
-  return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
-}
-
 function uint32Bytes(n) {
   return new Uint8Array([(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255]);
 }
 
 function readUint32(bytes, pos) {
   return ((bytes[pos] << 24) | (bytes[pos + 1] << 16) | (bytes[pos + 2] << 8) | bytes[pos + 3]) >>> 0;
+}
+
+function constantTimeEqual(a, b) {
+  const len = Math.max(a.length, b.length);
+  let diff = a.length ^ b.length;
+  for (let i = 0; i < len; i++) diff |= (a[i] || 0) ^ (b[i] || 0);
+  return diff === 0;
 }
 
 async function sha256(bytes) {
@@ -115,13 +110,45 @@ async function deriveSeed(password, salt, iterations) {
   return new Uint8Array(bits);
 }
 
+async function deriveKeysV4(password, salt) {
+  const material = await crypto.subtle.importKey('raw', utf8Bytes(password), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt, iterations: DEFAULT_ITERATIONS_V4, hash: 'SHA-256' }, material, 512);
+  const keymat = new Uint8Array(bits);
+  return {
+    routeKey: keymat.slice(0, 32),
+    authKey: keymat.slice(32, 64),
+  };
+}
+
+async function importHmacKey(keyBytes) {
+  return crypto.subtle.importKey('raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+}
+
+async function hmacSha256(key, bytes) {
+  return new Uint8Array(await crypto.subtle.sign('HMAC', key, bytes));
+}
+
 function zetaDigit(line, digit, mix) {
   const m = BigInt(ZETA_DECIMAL_DIGITS.length);
   const idx = Number((BigInt(line) * 1315423911n + BigInt(digit) * 2654435761n + (mix & 0xffffffffn)) % m);
   return ZETA_DECIMAL_DIGITS.charCodeAt(idx) - 48;
 }
 
-function makeKeystream(length, seedBytes) {
+function zetaWindowByte(line, digit, mix) {
+  let acc = Number((mix ^ BigInt(line) ^ (BigInt(digit) << 17n)) & 0xffn);
+  for (let k = 0; k < 8; k++) {
+    const d = zetaDigit(
+      line + k * 977,
+      digit + k * 37,
+      mix ^ (BigInt(k + 1) * 0x9e3779b97f4a7c15n)
+    );
+    acc = ((acc * 17) ^ (d + k * 29)) & 255;
+  }
+  return acc;
+}
+
+// Legacy v0.3 stream: kept so PNGs made with v0.3 still decode.
+function makeKeystreamV3(length, seedBytes) {
   const rng = new Xoshiro256StarStar(seedBytes);
   const stream = new Uint8Array(length);
   for (let i = 0; i < length; i++) {
@@ -141,6 +168,33 @@ function makeKeystream(length, seedBytes) {
   return stream;
 }
 
+// v0.4 stream: ZETA route remains essential; HMAC only hardens route selection and mixing.
+async function makeKeystreamV4(length, routeKeyBytes) {
+  const key = await importHmacKey(routeKeyBytes);
+  const stream = new Uint8Array(length);
+  const domain = utf8Bytes('ZETATRACECYPHER:ROUTE:V4');
+  let previous = new Uint8Array(32);
+  let counter = 0;
+  let p = 0;
+
+  while (p < length) {
+    const block = await hmacSha256(key, concatBytes(domain, uint32Bytes(counter), uint32Bytes(length), previous));
+    for (let j = 0; j < block.length && p < length; j++) {
+      const a = read64(block, (j * 3) % 24);
+      const c = read64(block, (j * 7) % 24);
+      const line = 1000000 + Number((a ^ BigInt(p) ^ BigInt(counter)) % 900000000n);
+      const digitLimit = Math.max(16, Math.min(1800, ZETA_DECIMAL_DIGITS.length - 8));
+      const digit = 1 + Number((c ^ (a >> 17n)) % BigInt(digitLimit));
+      const zbyte = zetaWindowByte(line, digit, a ^ c ^ BigInt(p));
+      const folded = Number((a >> BigInt((j % 8) * 8)) & 255n);
+      stream[p++] = (zbyte ^ block[j] ^ block[(j + 11) & 31] ^ folded) & 255;
+    }
+    previous = block;
+    counter++;
+  }
+  return stream;
+}
+
 function xorBytes(a, b) {
   const out = new Uint8Array(a.length);
   for (let i = 0; i < a.length; i++) out[i] = a[i] ^ b[i];
@@ -156,14 +210,14 @@ function crc32(bytes) {
   return (crc ^ 0xffffffff) >>> 0;
 }
 
-function buildCarrierBytes({ salt, iterations, cipher }) {
+function buildCarrierBytes({ salt, iterations, data, carrierVersion = CARRIER_VERSION_V2 }) {
   const header = concatBytes(
     new Uint8Array(CARRIER_MAGIC),
-    new Uint8Array([1, 0]),
+    new Uint8Array([carrierVersion, 0]),
     uint32Bytes(iterations >>> 0),
     salt,
-    uint32Bytes(cipher.length >>> 0),
-    cipher
+    uint32Bytes(data.length >>> 0),
+    data
   );
   return concatBytes(header, uint32Bytes(crc32(header)));
 }
@@ -171,130 +225,20 @@ function buildCarrierBytes({ salt, iterations, cipher }) {
 function parseCarrierBytes(bytes) {
   if (bytes.length < 34) throw new Error('PNGデータが短すぎます。');
   for (let i = 0; i < 4; i++) if (bytes[i] !== CARRIER_MAGIC[i]) throw new Error('ZETA TRACE PNGではありません。');
-  if (bytes[4] !== 1) throw new Error('未対応のPNGバージョンです。');
+  const version = bytes[4];
+  if (version !== CARRIER_VERSION_V1 && version !== CARRIER_VERSION_V2) throw new Error('未対応のPNGバージョンです。');
   const iterations = readUint32(bytes, 6);
   const salt = bytes.slice(10, 26);
-  const cipherLength = readUint32(bytes, 26);
-  const end = 30 + cipherLength;
+  const dataLength = readUint32(bytes, 26);
+  const end = 30 + dataLength;
   const crcPos = end;
   if (bytes.length < crcPos + 4) throw new Error('PNG内のデータが途中で切れています。');
   const body = bytes.slice(0, crcPos);
   const expected = readUint32(bytes, crcPos);
   const actual = crc32(body);
   if (expected !== actual) throw new Error('PNGからデータを正しく復元できません。');
-  return { iterations, salt, cipher: bytes.slice(30, end), carrierLength: crcPos + 4 };
+  return { version, iterations, salt, data: bytes.slice(30, end), carrierLength: crcPos + 4 };
 }
-
-
-
-function buildPartBytes({ bundleId, partIndex, partTotal, bundleLength, bundleCrc, payload }) {
-  if (partTotal > 65535) throw new Error('分割枚数が多すぎます。');
-  const header = concatBytes(
-    new Uint8Array(PART_MAGIC),
-    new Uint8Array([1, 0]),
-    bundleId,
-    uint16Bytes(partIndex),
-    uint16Bytes(partTotal),
-    uint32Bytes(bundleLength >>> 0),
-    uint32Bytes(bundleCrc >>> 0),
-    uint32Bytes(payload.length >>> 0),
-    payload
-  );
-  return concatBytes(header, uint32Bytes(crc32(header)));
-}
-
-function parsePartBytes(bytes) {
-  if (bytes.length < 42) throw new Error('PNGパートが短すぎます。');
-  for (let i = 0; i < 4; i++) if (bytes[i] !== PART_MAGIC[i]) throw new Error('ZETA TRACE bundle PNGではありません。');
-  if (bytes[4] !== 1) throw new Error('未対応のbundleバージョンです。');
-  const bundleId = bytes.slice(6, 22);
-  const partIndex = readUint16(bytes, 22);
-  const partTotal = readUint16(bytes, 24);
-  const bundleLength = readUint32(bytes, 26);
-  const bundleCrc = readUint32(bytes, 30);
-  const payloadLength = readUint32(bytes, 34);
-  const payloadStart = 38;
-  const crcPos = payloadStart + payloadLength;
-  if (!partTotal || partIndex >= partTotal) throw new Error('PNGパート情報が不正です。');
-  if (bytes.length < crcPos + 4) throw new Error('PNGパートが途中で切れています。');
-  const body = bytes.slice(0, crcPos);
-  const expected = readUint32(bytes, crcPos);
-  const actual = crc32(body);
-  if (expected !== actual) throw new Error('PNGパートを正しく復元できません。');
-  return {
-    bundleId,
-    bundleIdHex: bytesToHex(bundleId),
-    partIndex,
-    partTotal,
-    bundleLength,
-    bundleCrc,
-    payload: bytes.slice(payloadStart, crcPos),
-    partLength: crcPos + 4
-  };
-}
-
-function tryParseTraceBytes(bytes) {
-  try { return { kind: 'carrier', carrier: parseCarrierBytes(bytes) }; } catch {}
-  try { return { kind: 'part', part: parsePartBytes(bytes) }; } catch {}
-  throw new Error('PNGからデータを正しく復元できません。');
-}
-
-function splitCarrierIntoParts(carrierBytes) {
-  const bundleId = crypto.getRandomValues(new Uint8Array(16));
-  const bundleCrc = crc32(carrierBytes);
-  const total = Math.max(1, Math.ceil(carrierBytes.length / MAX_PART_PAYLOAD_BYTES));
-  const parts = [];
-  for (let index = 0; index < total; index++) {
-    const start = index * MAX_PART_PAYLOAD_BYTES;
-    const payload = carrierBytes.slice(start, Math.min(carrierBytes.length, start + MAX_PART_PAYLOAD_BYTES));
-    const bytes = buildPartBytes({
-      bundleId,
-      partIndex: index,
-      partTotal: total,
-      bundleLength: carrierBytes.length,
-      bundleCrc,
-      payload
-    });
-    parts.push({ index, total, bytes, payloadLength: payload.length, bundleIdHex: bytesToHex(bundleId) });
-  }
-  return parts;
-}
-
-function joinBundleParts(parts) {
-  if (!parts.length) throw new Error('PNGを読み込んでください。');
-  if (parts.length === 1 && parts[0].kind === 'carrier') return parts[0].carrierBytes;
-
-  const bundleParts = parts.filter(p => p.kind === 'part').map(p => p.part);
-  if (bundleParts.length !== parts.length) throw new Error('単体PNGと分割PNGが混在しています。');
-
-  const first = bundleParts[0];
-  const bundleIdHex = first.bundleIdHex;
-  const total = first.partTotal;
-  const bundleLength = first.bundleLength;
-  const bundleCrc = first.bundleCrc;
-
-  for (const part of bundleParts) {
-    if (part.bundleIdHex !== bundleIdHex) throw new Error('異なるbundleのPNGが混在しています。');
-    if (part.partTotal !== total) throw new Error('bundle枚数情報が一致しません。');
-    if (part.bundleLength !== bundleLength || part.bundleCrc !== bundleCrc) throw new Error('bundle情報が一致しません。');
-  }
-
-  const slots = new Array(total);
-  for (const part of bundleParts) {
-    if (slots[part.partIndex]) throw new Error(`${part.partIndex + 1}枚目が重複しています。`);
-    slots[part.partIndex] = part.payload;
-  }
-  const missing = [];
-  for (let i = 0; i < total; i++) if (!slots[i]) missing.push(i + 1);
-  if (missing.length) throw new Error(`${total}枚中 ${missing.length}枚不足しています。不足: ${missing.join(', ')}`);
-
-  const joined = concatBytes(...slots);
-  const carrierBytes = joined.slice(0, bundleLength);
-  if (carrierBytes.length !== bundleLength) throw new Error('bundleの結合長が一致しません。');
-  if (crc32(carrierBytes) !== bundleCrc) throw new Error('bundle全体のCRCが一致しません。');
-  return carrierBytes;
-}
-
 
 function zetaStageShift(stage) {
   const idx = (stage * 73 + 41) % ZETA_DECIMAL_DIGITS.length;
@@ -625,20 +569,24 @@ function carrierBytesFromLayout(imageData, layout, maxBytes = Infinity) {
   return new Uint8Array(bytes);
 }
 
-function traceBytesFromImageData(imageData) {
+function carrierBytesFromImageData(imageData) {
   const layouts = inferLayoutsFromImage(imageData.width, imageData.height);
   let lastError = null;
 
   for (const layout of layouts) {
     try {
+      const head = carrierBytesFromLayout(imageData, layout, Math.min(34, layout.padded));
+      if (head.length < 34) continue;
+      for (let i = 0; i < 4; i++) if (head[i] !== CARRIER_MAGIC[i]) throw new Error('magic mismatch');
       const full = carrierBytesFromLayout(imageData, layout);
-      tryParseTraceBytes(full);
+      // parseCarrierBytes verifies length and CRC. Return the full padded stream after validation.
+      parseCarrierBytes(full);
       return full;
     } catch (err) {
       lastError = err;
     }
   }
-  throw lastError && lastError.message
+  throw lastError && lastError.message && lastError.message !== 'magic mismatch'
     ? lastError
     : new Error('PNGからデータを正しく復元できません。');
 }
@@ -665,37 +613,58 @@ function imageFileToImageData(file, canvas) {
   });
 }
 
-async function createCipherFromMessage(message, password) {
-  const messageBytes = utf8Bytes(message);
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const seed = await deriveSeed(password, salt, DEFAULT_ITERATIONS);
-  const digest = (await sha256(messageBytes)).slice(0, 8);
-  const payload = concatBytes(new Uint8Array(MAGIC), uint32Bytes(messageBytes.length), digest, messageBytes);
-  const stream = makeKeystream(payload.length, seed);
-  const cipher = xorBytes(payload, stream);
-  return { salt, cipher, messageBytes };
+async function makeTagV4(authKeyBytes, salt, iterations, cipher) {
+  const key = await importHmacKey(authKeyBytes);
+  const domain = utf8Bytes('ZETATRACECYPHER:AUTH:V4');
+  const full = await hmacSha256(key, concatBytes(domain, salt, uint32Bytes(iterations), uint32Bytes(cipher.length), cipher));
+  return full.slice(0, TAG_BYTES);
 }
 
-async function decodeCipherToMessage(cipher, salt, iterations, password) {
-  const seed = await deriveSeed(password, salt, iterations);
-  const stream = makeKeystream(cipher.length, seed);
-  const plain = xorBytes(cipher, stream);
-
+function verifyPlainPayload(plain) {
   for (let i = 0; i < MAGIC.length; i++) {
     if (plain[i] !== MAGIC[i]) throw new Error('復号できません。');
   }
 
   const len = readUint32(plain, 4);
   if (len > plain.length - 16) throw new Error('復号できません。');
+  return { digest: plain.slice(8, 16), msgBytes: plain.slice(16, 16 + len) };
+}
 
-  const digest = plain.slice(8, 16);
-  const msgBytes = plain.slice(16, 16 + len);
+async function decodePayloadToText(plain) {
+  const { digest, msgBytes } = verifyPlainPayload(plain);
   const check = (await sha256(msgBytes)).slice(0, 8);
-  for (let i = 0; i < 8; i++) {
-    if (digest[i] !== check[i]) throw new Error('復号できません。');
+  if (!constantTimeEqual(digest, check)) throw new Error('復号できません。');
+  return new TextDecoder('utf-8', { fatal: true }).decode(msgBytes);
+}
+
+async function createCipherFromMessage(message, password) {
+  const messageBytes = utf8Bytes(message);
+  if (messageBytes.length > MAX_MESSAGE_BYTES) throw new Error(`${MAX_MESSAGE_BYTES} bytes以内にしてください。`);
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const keys = await deriveKeysV4(password, salt);
+  const digest = (await sha256(messageBytes)).slice(0, 8);
+  const payload = concatBytes(new Uint8Array(MAGIC), uint32Bytes(messageBytes.length), digest, messageBytes);
+  const stream = await makeKeystreamV4(payload.length, keys.routeKey);
+  const cipher = xorBytes(payload, stream);
+  const tag = await makeTagV4(keys.authKey, salt, DEFAULT_ITERATIONS_V4, cipher);
+  return { salt, data: concatBytes(cipher, tag), messageBytes, iterations: DEFAULT_ITERATIONS_V4, carrierVersion: CARRIER_VERSION_V2 };
+}
+
+async function decodeCipherToMessage(data, salt, iterations, password, carrierVersion = CARRIER_VERSION_V1) {
+  if (carrierVersion >= CARRIER_VERSION_V2) {
+    if (data.length <= TAG_BYTES) throw new Error('復号できません。');
+    const cipher = data.slice(0, data.length - TAG_BYTES);
+    const tag = data.slice(data.length - TAG_BYTES);
+    const keys = await deriveKeysV4(password, salt);
+    const expected = await makeTagV4(keys.authKey, salt, iterations || DEFAULT_ITERATIONS_V4, cipher);
+    if (!constantTimeEqual(tag, expected)) throw new Error('復号できません。');
+    const stream = await makeKeystreamV4(cipher.length, keys.routeKey);
+    return decodePayloadToText(xorBytes(cipher, stream));
   }
 
-  return new TextDecoder('utf-8', { fatal: true }).decode(msgBytes);
+  const seed = await deriveSeed(password, salt, iterations || DEFAULT_ITERATIONS_V3);
+  const stream = makeKeystreamV3(data.length, seed);
+  return decodePayloadToText(xorBytes(data, stream));
 }
 
 async function encode() {
@@ -707,124 +676,46 @@ async function encode() {
 
     setStatus('PNG生成中…');
     refs.savePngBtn.disabled = true;
-    generatedPages = [];
-    if (refs.encodePages) refs.encodePages.innerHTML = '';
     ensureTemplates();
 
-    const { salt, cipher, messageBytes } = await createCipherFromMessage(message, password);
-    const isLargeMessage = messageBytes.length > LARGE_MESSAGE_WARNING_BYTES;
-    const carrierBytes = buildCarrierBytes({ salt, iterations: DEFAULT_ITERATIONS, cipher });
-    const parts = splitCarrierIntoParts(carrierBytes);
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const mainCanvas = refs.encodeCanvas;
-
-    for (const part of parts) {
-      const canvas = document.createElement('canvas');
-      const layout = renderWalkPngToCanvas(canvas, part.bytes);
-      const name = parts.length === 1
-        ? `zeta-trace-${stamp}.png`
-        : `zeta-trace-${stamp}-${String(part.index + 1).padStart(3, '0')}-of-${String(part.total).padStart(3, '0')}.png`;
-      generatedPages.push({ canvas, name, layout, part });
-    }
-
-    // Keep the first page on the original canvas for compatibility and quick preview.
-    mainCanvas.width = generatedPages[0].canvas.width;
-    mainCanvas.height = generatedPages[0].canvas.height;
-    mainCanvas.getContext('2d').drawImage(generatedPages[0].canvas, 0, 0);
-
-    renderGeneratedPages();
-    generatedPngName = generatedPages[0].name;
-    refs.encodeInfo.textContent = `${carrierBytes.length} carrier bytes / ${parts.length} PNG / part payload max ${MAX_PART_PAYLOAD_BYTES} bytes${isLargeMessage ? ' / 50000 bytes超のため処理が重くなる場合があります' : ''}`;
+    const { salt, data, messageBytes, iterations, carrierVersion } = await createCipherFromMessage(message, password);
+    const carrierBytes = buildCarrierBytes({ salt, iterations, data, carrierVersion });
+    const layout = renderWalkPngToCanvas(refs.encodeCanvas, carrierBytes);
+    generatedPngName = `zeta-trace-v04-${new Date().toISOString().replace(/[:.]/g, '-')}.png`;
+    refs.encodeInfo.textContent = `${carrierBytes.length} bytes / ${layout.cols}×${layout.rows} cells / ${refs.encodeCanvas.width}×${refs.encodeCanvas.height}px`;
     refs.savePngBtn.disabled = false;
-    setStatus(`${parts.length}枚のPNGを生成しました。本文 ${messageBytes.length} bytes。${isLargeMessage ? ' 大きな本文のため、保存・読み込みに時間がかかる場合があります。' : ''}`, 'ok');
+    setStatus(`PNGを生成しました。本文 ${messageBytes.length} bytes。`, 'ok');
   } catch (err) {
     setStatus(err.message || String(err), 'error');
   }
 }
 
-function renderGeneratedPages() {
-  if (!refs.encodePages) return;
-  refs.encodePages.innerHTML = '';
-  for (const page of generatedPages) {
-    const card = document.createElement('div');
-    card.className = 'page-card';
-
-    const canvas = document.createElement('canvas');
-    canvas.width = page.canvas.width;
-    canvas.height = page.canvas.height;
-    canvas.getContext('2d').drawImage(page.canvas, 0, 0);
-
-    const meta = document.createElement('p');
-    meta.className = 'meta-text';
-    meta.textContent = `Page ${page.part.index + 1} / ${page.part.total} · ${page.bytes ? page.bytes.length : page.part.bytes.length} bytes · ${page.canvas.width}×${page.canvas.height}px`;
-
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.textContent = `PNG ${page.part.index + 1}を保存`;
-    button.addEventListener('click', () => saveCanvasAsPng(page.canvas, page.name));
-
-    card.appendChild(canvas);
-    card.appendChild(meta);
-    card.appendChild(button);
-    refs.encodePages.appendChild(card);
-  }
-}
-
-function saveCanvasAsPng(canvas, filename) {
-  return new Promise((resolve, reject) => {
-    canvas.toBlob((blob) => {
-      if (!blob) { reject(new Error('PNG保存に失敗しました。')); return; }
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = filename || 'zeta-trace.png';
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(a.href);
-      resolve();
-    }, 'image/png');
-  });
-}
-
-async function savePng() {
-  try {
-    if (refs.savePngBtn.disabled || !generatedPages.length) return;
-    for (let i = 0; i < generatedPages.length; i++) {
-      await saveCanvasAsPng(generatedPages[i].canvas, generatedPages[i].name);
-      if (generatedPages.length > 1) await new Promise(resolve => setTimeout(resolve, 180));
-    }
-    setStatus(generatedPages.length === 1 ? 'PNGを保存しました。' : `${generatedPages.length}枚のPNGを保存しました。`, 'ok');
-  } catch (err) {
-    setStatus(err.message || String(err), 'error');
-  }
+function savePng() {
+  if (refs.savePngBtn.disabled) return;
+  refs.encodeCanvas.toBlob((blob) => {
+    if (!blob) { setStatus('PNG保存に失敗しました。', 'error'); return; }
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = generatedPngName || 'zeta-trace.png';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(a.href);
+    setStatus('PNGを保存しました。', 'ok');
+  }, 'image/png');
 }
 
 async function loadPngFile(event) {
   try {
-    const files = Array.from(event.target.files || []);
-    if (!files.length) return;
-    if (files.some(file => file.type && !file.type.startsWith('image/'))) throw new Error('画像ファイルを選択してください。');
+    const file = event.target.files && event.target.files[0];
+    if (!file) return;
+    if (file.type && !file.type.startsWith('image/')) throw new Error('画像ファイルを選択してください。');
     setStatus('PNG読み込み中…');
-    loadedPngPages = [];
-    loadedPngImageData = null;
+    loadedPngImageData = await imageFileToImageData(file, refs.decodeCanvas);
     refs.plainOutput.value = '';
-
-    for (const file of files) {
-      const hidden = document.createElement('canvas');
-      const imageData = await imageFileToImageData(file, hidden);
-      loadedPngPages.push({ fileName: file.name, imageData });
-    }
-
-    loadedPngImageData = loadedPngPages[0].imageData;
-    refs.decodeCanvas.width = loadedPngImageData.width;
-    refs.decodeCanvas.height = loadedPngImageData.height;
-    refs.decodeCanvas.getContext('2d').putImageData(loadedPngImageData, 0, 0);
-
-    const names = loadedPngPages.map(p => p.fileName).join(', ');
-    refs.decodeInfo.textContent = `${loadedPngPages.length}枚読み込み / ${names}`;
-    setStatus(`${loadedPngPages.length}枚のPNGを読み込みました。`, 'ok');
+    refs.decodeInfo.textContent = `${file.name} / ${loadedPngImageData.width}×${loadedPngImageData.height}px`;
+    setStatus('PNGを読み込みました。', 'ok');
   } catch (err) {
-    loadedPngPages = [];
     loadedPngImageData = null;
     refs.decodeInfo.textContent = '読み込み失敗';
     setStatus(err.message || String(err), 'error');
@@ -836,31 +727,17 @@ async function loadPngFile(event) {
 async function decode() {
   try {
     const password = refs.decodePassword.value;
-    if (!loadedPngPages.length) throw new Error('PNGを読み込んでください。');
+    if (!loadedPngImageData) throw new Error('PNGを読み込んでください。');
     if (!password) throw new Error('パスワードを入力してください。');
     setStatus('復号中…');
     refs.plainOutput.value = '';
     ensureTemplates();
 
-    const parsed = [];
-    for (const page of loadedPngPages) {
-      const bytes = traceBytesFromImageData(page.imageData);
-      try {
-        const carrier = parseCarrierBytes(bytes);
-        parsed.push({ kind: 'carrier', carrier, carrierBytes: bytes.slice(0, carrier.carrierLength), fileName: page.fileName });
-      } catch {
-        const part = parsePartBytes(bytes);
-        parsed.push({ kind: 'part', part, fileName: page.fileName });
-      }
-    }
-
-    const carrierBytes = joinBundleParts(parsed);
-    const carrier = parseCarrierBytes(carrierBytes);
-    const message = await decodeCipherToMessage(carrier.cipher, carrier.salt, carrier.iterations, password);
+    const bytes = carrierBytesFromImageData(loadedPngImageData);
+    const carrier = parseCarrierBytes(bytes);
+    const message = await decodeCipherToMessage(carrier.data, carrier.salt, carrier.iterations, password, carrier.version);
     refs.plainOutput.value = message;
-
-    const partInfo = parsed[0].kind === 'part' ? ` / ${parsed.length} of ${parsed[0].part.partTotal} PNG` : '';
-    refs.decodeInfo.textContent = `復元 ${carrier.carrierLength} bytes / cipher ${carrier.cipher.length} bytes${partInfo}`;
+    refs.decodeInfo.textContent = `復元 ${carrier.carrierLength} bytes / data ${carrier.data.length} bytes / carrier v${carrier.version}`;
     setStatus('復号しました。', 'ok');
   } catch (err) {
     refs.plainOutput.value = '';
@@ -882,15 +759,12 @@ function clearEncode() {
   refs.messageInput.value = '';
   refs.encodeInfo.textContent = '未生成';
   refs.savePngBtn.disabled = true;
-  generatedPages = [];
-  if (refs.encodePages) refs.encodePages.innerHTML = '';
   refs.encodeCanvas.width = 1;
   refs.encodeCanvas.height = 1;
   setStatus('クリアしました。');
 }
 
 function clearDecode() {
-  loadedPngPages = [];
   loadedPngImageData = null;
   refs.decodeInfo.textContent = '未読み込み';
   refs.decodeCanvas.width = 1;
